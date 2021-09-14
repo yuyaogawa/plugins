@@ -1,3 +1,4 @@
 pyln-client>=0.8.0
 bitstring==3.1.6
 pyln-proto
+sqlalchemy==1.3.6

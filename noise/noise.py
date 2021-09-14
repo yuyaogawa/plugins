@@ -8,17 +8,32 @@ import os
 import struct
 import time
 import zbase32
+from sqlalchemy import Column, Integer, String, DateTime, PickleType
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import json
 
-
+Base = declarative_base()
 plugin = Plugin()
 
 TLV_KEYSEND_PREIMAGE = 5482373484
 TLV_NOISE_MESSAGE = 34349334
 TLV_NOISE_SIGNATURE = 34349335
+TLV_WHATSAT_SIGNATURE = 34349337
+TLV_NOISE_SENDER = 34349339
 TLV_NOISE_TIMESTAMP = 34349343
 
 
-class Message(object):
+class Message(Base):
+    __tablename__ = "message"
+    id = Column(Integer, primary_key=True)
+    sender = Column(String)
+    body = Column(String)
+    signature = Column(String)
+    payment = Column(PickleType)
+    verified = Column(String)
+
     def __init__(self, sender, body, signature, payment=None, id=None):
         self.id = id
         self.sender = sender
@@ -167,29 +182,37 @@ def on_htlc_accepted(onion, htlc, plugin, **kwargs):
         plugin.log("Payload is not a TLV payload")
         return {'result': 'continue'}
 
-    body_field = payload.get(34349334)
-    signature_field = payload.get(34349335)
+    body_field = payload.get(TLV_NOISE_MESSAGE)
+    #signature_field = payload.get(TLV_NOISE_SIGNATURE)
 
-    if body_field is None or signature_field is None:
-        plugin.log("Missing message body or signature, ignoring HTLC")
+    if body_field is None:
+        plugin.log("Missing message body, ignoring HTLC")
         return {'result': 'continue'}
 
     msg = Message(
-        id=len(plugin.messages),
+        #id=len(plugin.messages),
         sender=None,
         body=body_field.value,
-        signature=signature_field.value,
+        signature=None,
         payment=None)
 
-    # Filter out the signature so we can check it against the rest of the payload
-    sigpayload = TlvPayload()
-    sigpayload.fields = filter(lambda x: x.typenum != TLV_NOISE_SIGNATURE, payload.fields)
-    sigmsg = hexlify(sigpayload.to_bytes()).decode('ASCII')
+    if payload.get(TLV_NOISE_SIGNATURE) is not None:
+        msg.signature = payload.get(TLV_NOISE_SIGNATURE).value
 
-    zsig = zbase32.encode(msg.signature).decode('ASCII')
-    sigcheck = plugin.rpc.checkmessage(sigmsg, zsig)
-    msg.sender = sigcheck['pubkey']
-    msg.verified = sigcheck['verified']
+        # Filter out the signature so we can check it against the rest of the payload
+        sigpayload = TlvPayload()
+        sigpayload.fields = filter(lambda x: x.typenum != TLV_NOISE_SIGNATURE, payload.fields)
+        sigmsg = hexlify(sigpayload.to_bytes()).decode('ASCII')
+
+        zsig = zbase32.encode(msg.signature).decode('ASCII')
+        sigcheck = plugin.rpc.checkmessage(sigmsg, zsig)
+        msg.sender = sigcheck['pubkey']
+        msg.verified = sigcheck['verified']
+
+    else:
+        msg.sender = hexlify(payload.get(TLV_NOISE_SENDER).value).decode('ASCII') if payload.get(TLV_NOISE_SENDER) is not None else None
+        msg.signature = payload.get(TLV_WHATSAT_SIGNATURE).value if payload.get(TLV_WHATSAT_SIGNATURE) is not None else None
+        msg.verified = None
 
     preimage = payload.get(TLV_KEYSEND_PREIMAGE)
     if preimage is not None:
@@ -202,6 +225,9 @@ def on_htlc_accepted(onion, htlc, plugin, **kwargs):
         res = {'result': 'continue'}
 
     plugin.messages.append(msg)
+    s = plugin.Session()
+    s.add(msg)
+    s.commit()
     print("Delivering message to {c} waiters".format(
         c=len(plugin.receive_waiters)
     ))
@@ -219,6 +245,16 @@ def init(configuration, options, plugin, **kwargs):
     print("Starting noise chat plugin")
     plugin.messages = []
     plugin.receive_waiters = []
+
+    db_filename = 'sqlite:///' + os.path.join(
+        configuration['lightning-dir'],
+        'noise.db'
+    )
+
+    engine = create_engine(db_filename, echo=True)
+    Base.metadata.create_all(engine)
+    plugin.Session = sessionmaker()
+    plugin.Session.configure(bind=engine)
 
 
 plugin.run()
